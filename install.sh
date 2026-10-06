@@ -140,13 +140,27 @@ log "Pulling HivePanel containers..."
 docker compose pull
 log "Starting database and Redis..."
 docker compose up -d mariadb redis
-log "Starting HivePanel..."
-docker compose up -d panel queue scheduler nginx
+log "Starting HivePanel application..."
+docker compose up -d panel
+
+log "Waiting for the HivePanel application container..."
+for attempt in $(seq 1 60); do
+    docker compose exec -T panel php artisan about >/dev/null 2>&1 && break
+    [[ "$attempt" -lt 60 ]] || fail "The HivePanel application container did not become ready. Run: cd ${INSTALL_DIR} && docker compose logs panel"
+    sleep 2
+done
+
 log "Running database migrations..."
 docker compose exec -T panel php artisan migrate --force
 docker compose exec -T panel php artisan optimize
 log "Creating administrator..."
 docker compose exec -T -e HIVEPANEL_ADMIN_NAME="$ADMIN_NAME" -e HIVEPANEL_ADMIN_EMAIL="$ADMIN_EMAIL" -e HIVEPANEL_ADMIN_PASSWORD="$ADMIN_PASSWORD" panel php artisan hivepanel:create-admin
+
+log "Starting background services..."
+docker compose up -d queue scheduler
+
+log "Starting Nginx..."
+docker compose up -d --force-recreate nginx
 
 log "Writing managed installation metadata..."
 cat > "${INSTALL_DIR}/runtime/installation.json" <<JSON
@@ -181,13 +195,23 @@ if [[ "$ENABLE_HTTPS" =~ ^[Yy]$ ]]; then
         log "Certificate request failed. HivePanel will remain available over HTTP until HTTPS is configured."
         sed -i "s#^APP_URL=.*#APP_URL=http://${DOMAIN}#" .env
         docker compose up -d --force-recreate panel queue scheduler
+        for attempt in $(seq 1 60); do
+            docker compose exec -T panel php artisan about >/dev/null 2>&1 && break
+            [[ "$attempt" -lt 60 ]] || fail "HivePanel did not become ready after reverting to HTTP."
+            sleep 2
+        done
+        docker compose up -d --force-recreate nginx
     fi
 fi
 
+# Nginx must be recreated after the final panel container is in place. This also
+# refreshes the FastCGI upstream if Docker assigned the panel a new address.
+docker compose up -d --force-recreate nginx
+
 log "Checking HivePanel health..."
-for attempt in $(seq 1 30); do
+for attempt in $(seq 1 60); do
     curl -fsS -H "Host: ${DOMAIN}" "http://127.0.0.1/up" >/dev/null 2>&1 && break
-    [[ "$attempt" -lt 30 ]] || fail "HivePanel started but did not pass its health check. Run: cd ${INSTALL_DIR} && docker compose logs"
+    [[ "$attempt" -lt 60 ]] || fail "HivePanel started but did not pass its health check. Run: cd ${INSTALL_DIR} && docker compose logs"
     sleep 2
 done
 

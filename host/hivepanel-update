@@ -83,11 +83,24 @@ docker compose exec -T panel php artisan optimize:clear || true
 docker compose exec -T panel php artisan optimize || true
 
 status restarting "Restarting HivePanel services." "$BACKUP_FILE"
-if ! docker compose up -d panel queue scheduler nginx; then
-    fail "One or more HivePanel services failed to restart."
+if ! docker compose up -d panel queue scheduler; then
+    fail "One or more HivePanel application services failed to restart."
+fi
+
+# Recreate Nginx only after the final panel container is running. Nginx may have
+# resolved the previous panel container address before Docker replaced it.
+if ! docker compose up -d --force-recreate nginx; then
+    fail "The HivePanel web server failed to restart."
 fi
 
 docker compose exec -T panel php artisan up >/dev/null 2>&1 || true
+
+DOMAIN="$(sed -n 's/^PANEL_DOMAIN=//p' .env | head -n1)"
+for attempt in $(seq 1 60); do
+    curl -fsS -H "Host: ${DOMAIN}" "http://127.0.0.1/up" >/dev/null 2>&1 && break
+    [[ "$attempt" -lt 60 ]] || fail "HivePanel services restarted but the panel did not pass its health check."
+    sleep 2
+done
 if [[ -f "${INSTALL_DIR}/runtime/installation.json" ]]; then
     INSTALLER_REPOSITORY="$(sed -n 's/.*"installer_repository"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "${INSTALL_DIR}/runtime/installation.json" | head -n1)"
     INSTALLER_REPOSITORY="${INSTALLER_REPOSITORY:-HiveDevelopment/HivePanel-Installer}"

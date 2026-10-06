@@ -10,6 +10,14 @@ log() {
     printf '\033[1;33m[HivePanel]\033[0m %s\n' "$1"
 }
 
+success() {
+    printf '\033[1;32m[HivePanel]\033[0m %s\n' "$1"
+}
+
+warn() {
+    printf '\033[1;33m[HivePanel] WARNING:\033[0m %s\n' "$1" >&2
+}
+
 fail() {
     printf '\033[1;31m[HivePanel] ERROR:\033[0m %s\n' "$1" >&2
     exit 1
@@ -35,6 +43,7 @@ on_error() {
 trap on_error ERR
 
 [[ "$EUID" -eq 0 ]] || fail "Run this installer as root or with sudo."
+
 command -v curl >/dev/null 2>&1 || fail "curl is required."
 command -v openssl >/dev/null 2>&1 || fail "openssl is required."
 
@@ -50,19 +59,31 @@ install_docker() {
 
         if ! docker info >/dev/null 2>&1; then
             log "Starting Docker..."
-            systemctl enable --now docker
+
+            if command -v systemctl >/dev/null 2>&1; then
+                systemctl enable --now docker
+            else
+                fail "Docker is installed but is not running, and systemctl is unavailable."
+            fi
         fi
 
         docker info >/dev/null 2>&1 || fail "Docker is installed but the Docker daemon is not responding."
+
         return
     fi
 
     log "Installing Docker Engine and Docker Compose..."
 
     if command -v dnf >/dev/null 2>&1; then
-        dnf -y install dnf-plugins-core curl ca-certificates
+        dnf -y install \
+            dnf-plugins-core \
+            curl \
+            ca-certificates
 
-        dnf config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo >/dev/null 2>&1 || true
+        dnf config-manager \
+            --add-repo \
+            https://download.docker.com/linux/centos/docker-ce.repo \
+            >/dev/null 2>&1 || true
 
         dnf -y install \
             docker-ce \
@@ -90,10 +111,14 @@ install_docker() {
                 ;;
         esac
 
-        curl -fsSL "https://download.docker.com/linux/${ID}/gpg" -o /etc/apt/keyrings/docker.asc
+        curl -fsSL \
+            "https://download.docker.com/linux/${ID}/gpg" \
+            -o /etc/apt/keyrings/docker.asc
+
         chmod a+r /etc/apt/keyrings/docker.asc
 
-        echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/${ID} ${VERSION_CODENAME} stable" > /etc/apt/sources.list.d/docker.list
+        echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/${ID} ${VERSION_CODENAME} stable" \
+            > /etc/apt/sources.list.d/docker.list
 
         apt-get update
 
@@ -109,7 +134,11 @@ install_docker() {
 
     log "Starting Docker..."
 
-    systemctl enable --now docker
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl enable --now docker
+    else
+        fail "Docker was installed, but systemctl is unavailable."
+    fi
 
     command -v docker >/dev/null 2>&1 || fail "Docker was installed but the docker command is unavailable."
     docker compose version >/dev/null 2>&1 || fail "Docker Compose was installed but is unavailable."
@@ -126,7 +155,7 @@ install_docker() {
         sleep 1
     done
 
-    log "Docker Engine and Docker Compose installed successfully."
+    success "Docker Engine and Docker Compose installed successfully."
 }
 
 resolve_version() {
@@ -152,10 +181,255 @@ resolve_version() {
     printf '%s' "${tag#v}"
 }
 
-printf '\nHivePanel Installer\n'
-printf '===================\n\n'
+hivepanel_docker_state_exists() {
+    if docker ps -a --format '{{.Names}}' 2>/dev/null | grep -q '^hivepanel-'; then
+        return 0
+    fi
+
+    if docker volume ls --format '{{.Name}}' 2>/dev/null | grep -q '^hivepanel_'; then
+        return 0
+    fi
+
+    if docker network ls --format '{{.Name}}' 2>/dev/null | grep -q '^hivepanel_'; then
+        return 0
+    fi
+
+    return 1
+}
+
+remove_hivepanel_docker_resources() {
+    local containers
+    local volumes
+    local networks
+
+    containers="$(
+        docker ps -a \
+            --format '{{.Names}}' \
+            2>/dev/null \
+        | grep '^hivepanel-' || true
+    )"
+
+    if [[ -n "$containers" ]]; then
+        log "Removing existing HivePanel containers..."
+
+        while IFS= read -r container; do
+            [[ -n "$container" ]] || continue
+            docker rm -f "$container" >/dev/null 2>&1 || true
+        done <<< "$containers"
+    fi
+
+    volumes="$(
+        docker volume ls \
+            --format '{{.Name}}' \
+            2>/dev/null \
+        | grep '^hivepanel_' || true
+    )"
+
+    if [[ -n "$volumes" ]]; then
+        log "Removing existing HivePanel data volumes..."
+
+        while IFS= read -r volume; do
+            [[ -n "$volume" ]] || continue
+            docker volume rm -f "$volume" >/dev/null 2>&1 || true
+        done <<< "$volumes"
+    fi
+
+    networks="$(
+        docker network ls \
+            --format '{{.Name}}' \
+            2>/dev/null \
+        | grep '^hivepanel_' || true
+    )"
+
+    if [[ -n "$networks" ]]; then
+        log "Removing existing HivePanel Docker networks..."
+
+        while IFS= read -r network; do
+            [[ -n "$network" ]] || continue
+            docker network rm "$network" >/dev/null 2>&1 || true
+        done <<< "$networks"
+    fi
+}
+
+handle_existing_installation() {
+    local directory_exists=false
+    local docker_state_exists=false
+    local answer
+    local confirmation
+
+    if [[ -e "$INSTALL_DIR" && -n "$(ls -A "$INSTALL_DIR" 2>/dev/null || true)" ]]; then
+        directory_exists=true
+    fi
+
+    if hivepanel_docker_state_exists; then
+        docker_state_exists=true
+    fi
+
+    if [[ "$directory_exists" == false && "$docker_state_exists" == false ]]; then
+        return
+    fi
+
+    printf '\n'
+    log "An existing or incomplete HivePanel installation was detected."
+    printf '\n'
+
+    if [[ "$directory_exists" == true ]]; then
+        printf '  Installation directory: %s\n' "$INSTALL_DIR"
+    fi
+
+    if [[ "$docker_state_exists" == true ]]; then
+        printf '  Existing HivePanel Docker resources were detected.\n'
+    fi
+
+    printf '\n'
+    printf '\033[1;31mWARNING:\033[0m Reinstalling will permanently delete the existing HivePanel database and application data.\n'
+    printf '\n'
+
+    read -r -u 3 -p "Remove the existing installation and reinstall HivePanel? [y/N]: " answer
+
+    if [[ ! "$answer" =~ ^[Yy]$ ]]; then
+        fail "Installation cancelled. The existing HivePanel installation was not changed."
+    fi
+
+    printf '\n'
+    read -r -u 3 -p "Type REINSTALL to confirm permanent deletion: " confirmation
+
+    if [[ "$confirmation" != "REINSTALL" ]]; then
+        fail "Reinstallation cancelled. The existing HivePanel installation was not changed."
+    fi
+
+    printf '\n'
+    log "Removing existing HivePanel installation..."
+
+    if [[ -f "${INSTALL_DIR}/compose.yaml" ]]; then
+        log "Stopping existing HivePanel Compose project..."
+
+        (
+            cd "$INSTALL_DIR"
+            docker compose down --volumes --remove-orphans || true
+        )
+    fi
+
+    remove_hivepanel_docker_resources
+
+    if [[ -d "$INSTALL_DIR" ]]; then
+        log "Removing existing HivePanel files..."
+        rm -rf "$INSTALL_DIR"
+    fi
+
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl disable --now hivepanel-update.path >/dev/null 2>&1 || true
+        systemctl stop hivepanel-update.service >/dev/null 2>&1 || true
+    fi
+
+    rm -f \
+        /usr/local/sbin/hivepanel-update \
+        /etc/systemd/system/hivepanel-update.service \
+        /etc/systemd/system/hivepanel-update.path
+
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl daemon-reload >/dev/null 2>&1 || true
+    fi
+
+    success "Previous HivePanel installation removed."
+}
+
+configure_firewall() {
+    local configured=false
+
+    if command -v firewall-cmd >/dev/null 2>&1; then
+        if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet firewalld; then
+            log "Configuring firewalld..."
+
+            firewall-cmd \
+                --permanent \
+                --add-service=http \
+                >/dev/null
+
+            if [[ "$ENABLE_HTTPS" =~ ^[Yy]$ ]]; then
+                firewall-cmd \
+                    --permanent \
+                    --add-service=https \
+                    >/dev/null
+            fi
+
+            firewall-cmd --reload >/dev/null
+
+            configured=true
+
+            success "firewalld configured for HivePanel."
+        fi
+    fi
+
+    if [[ "$configured" == false ]] && command -v ufw >/dev/null 2>&1; then
+        if ufw status 2>/dev/null | grep -q '^Status: active'; then
+            log "Configuring UFW..."
+
+            ufw allow 80/tcp >/dev/null
+
+            if [[ "$ENABLE_HTTPS" =~ ^[Yy]$ ]]; then
+                ufw allow 443/tcp >/dev/null
+            fi
+
+            configured=true
+
+            success "UFW configured for HivePanel."
+        fi
+    fi
+
+    if [[ "$configured" == false ]]; then
+        log "No active supported host firewall detected."
+    fi
+}
+
+wait_for_application() {
+    log "Waiting for the HivePanel application container..."
+
+    for attempt in $(seq 1 60); do
+        if docker compose exec -T panel php artisan about >/dev/null 2>&1; then
+            return
+        fi
+
+        if [[ "$attempt" -eq 60 ]]; then
+            docker compose logs --tail=100 panel || true
+            fail "The HivePanel application container did not become ready. Run: cd ${INSTALL_DIR} && docker compose logs panel"
+        fi
+
+        sleep 2
+    done
+}
+
+wait_for_database() {
+    log "Waiting for the HivePanel database..."
+
+    for attempt in $(seq 1 60); do
+        if docker compose exec -T mariadb mariadb-admin ping \
+            -h 127.0.0.1 \
+            -u root \
+            "-p${DB_ROOT_PASSWORD}" \
+            --silent \
+            >/dev/null 2>&1
+        then
+            return
+        fi
+
+        if [[ "$attempt" -eq 60 ]]; then
+            docker compose logs --tail=100 mariadb || true
+            fail "MariaDB did not become ready."
+        fi
+
+        sleep 2
+    done
+}
+
+printf '\n'
+printf 'HivePanel Installer\n'
+printf '===================\n'
+printf '\n'
 
 install_docker
+
+handle_existing_installation
 
 VERSION="$(resolve_version)"
 
@@ -205,9 +479,7 @@ if [[ "$ENABLE_HTTPS" =~ ^[Yy]$ ]]; then
     CERT_EMAIL="${CERT_EMAIL:-$ADMIN_EMAIL}"
 fi
 
-if [[ -e "$INSTALL_DIR" && -n "$(ls -A "$INSTALL_DIR" 2>/dev/null || true)" ]]; then
-    fail "$INSTALL_DIR is not empty."
-fi
+configure_firewall
 
 log "Installing HivePanel v${VERSION}..."
 
@@ -286,23 +558,13 @@ log "Starting database and Redis..."
 
 docker compose up -d mariadb redis
 
+wait_for_database
+
 log "Starting HivePanel application..."
 
 docker compose up -d panel
 
-log "Waiting for the HivePanel application container..."
-
-for attempt in $(seq 1 60); do
-    if docker compose exec -T panel php artisan about >/dev/null 2>&1; then
-        break
-    fi
-
-    if [[ "$attempt" -eq 60 ]]; then
-        fail "The HivePanel application container did not become ready. Run: cd ${INSTALL_DIR} && docker compose logs panel"
-    fi
-
-    sleep 2
-done
+wait_for_application
 
 log "Running database migrations..."
 
@@ -368,8 +630,12 @@ curl -fsSL \
 
 chmod 0755 /usr/local/sbin/hivepanel-update
 
-systemctl daemon-reload
-systemctl enable --now hivepanel-update.path
+if command -v systemctl >/dev/null 2>&1; then
+    systemctl daemon-reload
+    systemctl enable --now hivepanel-update.path
+else
+    warn "systemd is unavailable. The HivePanel automatic update runner could not be enabled."
+fi
 
 if [[ "$ENABLE_HTTPS" =~ ^[Yy]$ ]]; then
     log "Requesting Let's Encrypt certificate..."
@@ -389,9 +655,9 @@ if [[ "$ENABLE_HTTPS" =~ ^[Yy]$ ]]; then
 
         docker compose up -d --force-recreate nginx
 
-        log "HTTPS enabled."
+        success "HTTPS enabled."
     else
-        log "Certificate request failed. HivePanel will remain available over HTTP until HTTPS is configured."
+        warn "Certificate request failed. HivePanel will remain available over HTTP until HTTPS is configured."
 
         APP_SCHEME="http"
 
@@ -401,27 +667,15 @@ if [[ "$ENABLE_HTTPS" =~ ^[Yy]$ ]]; then
 
         docker compose up -d --force-recreate panel queue scheduler
 
-        log "Waiting for HivePanel after reverting to HTTP..."
-
-        for attempt in $(seq 1 60); do
-            if docker compose exec -T panel php artisan about >/dev/null 2>&1; then
-                break
-            fi
-
-            if [[ "$attempt" -eq 60 ]]; then
-                fail "HivePanel did not become ready after reverting to HTTP."
-            fi
-
-            sleep 2
-        done
+        wait_for_application
 
         docker compose up -d --force-recreate nginx
     fi
 fi
 
-# Nginx must be recreated after the final panel container is in place.
-# This ensures the FastCGI upstream points at the current panel container
-# even if Docker assigned it a different address during installation.
+# The panel container may receive a different Docker address when recreated.
+# Recreating Nginx here ensures its FastCGI upstream points to the current
+# HivePanel application container.
 log "Finalising web services..."
 
 docker compose up -d --force-recreate nginx
@@ -438,6 +692,11 @@ for attempt in $(seq 1 60); do
     fi
 
     if [[ "$attempt" -eq 60 ]]; then
+        printf '\n'
+        docker compose ps || true
+        printf '\n'
+        docker compose logs --tail=100 nginx panel || true
+
         fail "HivePanel started but did not pass its health check. Run: cd ${INSTALL_DIR} && docker compose logs"
     fi
 

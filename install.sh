@@ -520,12 +520,24 @@ case "$INSTALL_MODE" in
         HTTPS_PORT=8443
 
         printf '\n'
-        read -r -u 3 -p "HTTP port for HivePanel [8080]: " HTTP_PORT
+        read -r -u 3 -p "HTTP port for HivePanel [8090]: " HTTP_PORT
 
-        HTTP_PORT="${HTTP_PORT:-8080}"
+        HTTP_PORT="${HTTP_PORT:-8090}"
 
         if [[ ! "$HTTP_PORT" =~ ^[0-9]+$ ]] || (( HTTP_PORT < 1 || HTTP_PORT > 65535 )); then
             fail "Invalid HTTP port: ${HTTP_PORT}"
+        fi
+
+        if [[ "$HTTP_PORT" -eq 8080 ]]; then
+            printf '\n'
+            warn "Port 8080 is normally reserved for the HivePanel daemon."
+            printf '\n'
+
+            read -r -u 3 -p "Use port 8080 anyway? [y/N]: " USE_RESERVED_PORT
+
+            if [[ ! "$USE_RESERVED_PORT" =~ ^[Yy]$ ]]; then
+                fail "Installation cancelled. Use port 8090 or another available port."
+            fi
         fi
 
         printf '\n'

@@ -1,0 +1,10 @@
+server {
+    listen 80;
+    server_name get.hivepanel.dev;
+
+    location / {
+        default_type text/x-shellscript;
+        add_header Cache-Control "no-cache, no-store, must-revalidate" always;
+        return 302 https://raw.githubusercontent.com/HiveDevelopment/HivePanel-Installer/main/get/install.sh;
+    }
+}

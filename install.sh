@@ -292,10 +292,14 @@ handle_existing_installation() {
     fi
 
     printf '\n'
+    printf '\033[1;31mIMPORTANT:\033[0m The confirmation below is case-sensitive.\n'
+    printf 'You must type \033[1mREINSTALL\033[0m exactly as shown.\n'
+    printf '\n'
+
     read -r -u 3 -p "Type REINSTALL to confirm permanent deletion: " confirmation
 
     if [[ "$confirmation" != "REINSTALL" ]]; then
-        fail "Reinstallation cancelled. The existing HivePanel installation was not changed."
+        fail "Reinstallation cancelled. You must type REINSTALL exactly as shown (case-sensitive)."
     fi
 
     printf '\n'
@@ -341,20 +345,26 @@ configure_firewall() {
         if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet firewalld; then
             log "Configuring firewalld..."
 
-            firewall-cmd \
-                --permanent \
-                --add-service=http \
-                >/dev/null
-
-            if [[ "$ENABLE_HTTPS" =~ ^[Yy]$ ]]; then
+            if [[ "$REVERSE_PROXY" == true ]]; then
                 firewall-cmd \
                     --permanent \
-                    --add-service=https \
+                    --add-port="${HTTP_PORT}/tcp" \
                     >/dev/null
+            else
+                firewall-cmd \
+                    --permanent \
+                    --add-service=http \
+                    >/dev/null
+
+                if [[ "$ENABLE_HTTPS" =~ ^[Yy]$ ]]; then
+                    firewall-cmd \
+                        --permanent \
+                        --add-service=https \
+                        >/dev/null
+                fi
             fi
 
             firewall-cmd --reload >/dev/null
-
             configured=true
 
             success "firewalld configured for HivePanel."
@@ -365,10 +375,14 @@ configure_firewall() {
         if ufw status 2>/dev/null | grep -q '^Status: active'; then
             log "Configuring UFW..."
 
-            ufw allow 80/tcp >/dev/null
+            if [[ "$REVERSE_PROXY" == true ]]; then
+                ufw allow "${HTTP_PORT}/tcp" >/dev/null
+            else
+                ufw allow 80/tcp >/dev/null
 
-            if [[ "$ENABLE_HTTPS" =~ ^[Yy]$ ]]; then
-                ufw allow 443/tcp >/dev/null
+                if [[ "$ENABLE_HTTPS" =~ ^[Yy]$ ]]; then
+                    ufw allow 443/tcp >/dev/null
+                fi
             fi
 
             configured=true
@@ -464,20 +478,67 @@ printf '\n'
 [[ "$ADMIN_PASSWORD" == "$ADMIN_PASSWORD_CONFIRM" ]] || fail "Administrator passwords do not match."
 [[ ${#ADMIN_PASSWORD} -ge 8 ]] || fail "Administrator password must be at least 8 characters."
 
-read -r -u 3 -p "Enable Let's Encrypt HTTPS? [Y/n]: " ENABLE_HTTPS
+printf '\n'
+printf 'How will HivePanel be accessed?\n'
+printf '\n'
+printf '  1) Directly from the internet\n'
+printf '     HivePanel will use ports 80/443 and can configure Let'\''s Encrypt HTTPS.\n'
+printf '\n'
+printf '  2) Behind an existing reverse proxy\n'
+printf '     Use this for Caddy, Traefik, Nginx Proxy Manager, or another reverse proxy.\n'
+printf '     HivePanel will expose HTTP on a configurable port and your proxy handles HTTPS.\n'
+printf '\n'
 
-ENABLE_HTTPS="${ENABLE_HTTPS:-Y}"
+read -r -u 3 -p "Select installation mode [1/2]: " INSTALL_MODE
 
-CERT_EMAIL=""
-APP_SCHEME="http"
+case "$INSTALL_MODE" in
+    1)
+        REVERSE_PROXY=false
+        HTTP_PORT=80
+        HTTPS_PORT=443
 
-if [[ "$ENABLE_HTTPS" =~ ^[Yy]$ ]]; then
-    APP_SCHEME="https"
+        printf '\n'
+        read -r -u 3 -p "Enable Let's Encrypt HTTPS? [Y/n]: " ENABLE_HTTPS
 
-    read -r -u 3 -p "Let's Encrypt email [$ADMIN_EMAIL]: " CERT_EMAIL
+        ENABLE_HTTPS="${ENABLE_HTTPS:-Y}"
 
-    CERT_EMAIL="${CERT_EMAIL:-$ADMIN_EMAIL}"
-fi
+        CERT_EMAIL=""
+        APP_SCHEME="http"
+
+        if [[ "$ENABLE_HTTPS" =~ ^[Yy]$ ]]; then
+            APP_SCHEME="https"
+
+            read -r -u 3 -p "Let's Encrypt email [$ADMIN_EMAIL]: " CERT_EMAIL
+            CERT_EMAIL="${CERT_EMAIL:-$ADMIN_EMAIL}"
+        fi
+        ;;
+    2)
+        REVERSE_PROXY=true
+        ENABLE_HTTPS=N
+        CERT_EMAIL=""
+        APP_SCHEME="https"
+        HTTPS_PORT=8443
+
+        printf '\n'
+        read -r -u 3 -p "HTTP port for HivePanel [8080]: " HTTP_PORT
+
+        HTTP_PORT="${HTTP_PORT:-8080}"
+
+        if [[ ! "$HTTP_PORT" =~ ^[0-9]+$ ]] || (( HTTP_PORT < 1 || HTTP_PORT > 65535 )); then
+            fail "Invalid HTTP port: ${HTTP_PORT}"
+        fi
+
+        printf '\n'
+        log "Reverse proxy mode selected."
+        printf 'HivePanel will listen for HTTP connections on port %s.\n' "$HTTP_PORT"
+        printf 'Your reverse proxy should forward %s to HivePanel on port %s.\n' "$DOMAIN" "$HTTP_PORT"
+        printf 'HTTPS should be configured on your reverse proxy, not inside HivePanel.\n'
+        printf '\n'
+        ;;
+    *)
+        fail "Invalid installation mode. Enter 1 or 2."
+        ;;
+esac
 
 configure_firewall
 
@@ -544,8 +605,8 @@ MAIL_MAILER=log
 MAIL_FROM_ADDRESS=${ADMIN_EMAIL}
 MAIL_FROM_NAME=HivePanel
 VITE_APP_NAME=HivePanel
-HTTP_PORT=80
-HTTPS_PORT=443
+HTTP_PORT=${HTTP_PORT}
+HTTPS_PORT=${HTTPS_PORT}
 ENV
 
 chmod 0600 .env
@@ -637,7 +698,7 @@ else
     warn "systemd is unavailable. The HivePanel automatic update runner could not be enabled."
 fi
 
-if [[ "$ENABLE_HTTPS" =~ ^[Yy]$ ]]; then
+if [[ "$REVERSE_PROXY" == false && "$ENABLE_HTTPS" =~ ^[Yy]$ ]]; then
     log "Requesting Let's Encrypt certificate..."
 
     if docker compose --profile tools run \
@@ -685,7 +746,7 @@ log "Checking HivePanel health..."
 for attempt in $(seq 1 60); do
     if curl -fsS \
         -H "Host: ${DOMAIN}" \
-        "http://127.0.0.1/up" \
+        "http://127.0.0.1:${HTTP_PORT}/up" \
         >/dev/null 2>&1
     then
         break
@@ -709,4 +770,23 @@ printf '\n'
 printf 'Panel: %s://%s\n' "$APP_SCHEME" "$DOMAIN"
 printf 'Install directory: %s\n' "$INSTALL_DIR"
 printf 'Updates: Admin -> Updates\n'
+
+if [[ "$REVERSE_PROXY" == true ]]; then
+    printf '\n'
+    printf 'Reverse proxy mode:\n'
+    printf '  HivePanel HTTP port: %s\n' "$HTTP_PORT"
+    printf '  Public URL: https://%s\n' "$DOMAIN"
+    printf '\n'
+    printf 'Configure your reverse proxy to forward requests for:\n'
+    printf '  %s\n' "$DOMAIN"
+    printf '\n'
+    printf 'to:\n'
+    printf '  http://<HivePanel server IP>:%s\n' "$HTTP_PORT"
+    printf '\n'
+    printf 'If the reverse proxy is running on this same server, you can use:\n'
+    printf '  http://127.0.0.1:%s\n' "$HTTP_PORT"
+    printf '\n'
+    printf 'Your reverse proxy should handle the TLS/SSL certificate.\n'
+fi
+
 printf '\n'

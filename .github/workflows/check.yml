@@ -17,3 +17,8 @@ jobs:
           bash -n install.sh
           bash -n get/install.sh
           bash -n host/hivepanel-update
+          bash -n repair.sh
+          bash -n host/hivepanel-common.sh
+
+      - name: Host regression tests
+        run: sudo python3 tests/test_host_tools.py

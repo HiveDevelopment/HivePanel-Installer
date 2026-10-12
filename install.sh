@@ -47,6 +47,36 @@ trap on_error ERR
 command -v curl >/dev/null 2>&1 || fail "curl is required."
 command -v openssl >/dev/null 2>&1 || fail "openssl is required."
 
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+ACTION=install
+REPAIR_ARGS=()
+for argument in "$@"; do
+    case "$argument" in
+        --repair) ACTION=repair ;;
+        --check) ACTION=repair; REPAIR_ARGS+=(--check) ;;
+        --yes) REPAIR_ARGS+=(--yes) ;;
+        --help|-h) printf 'Usage: install.sh [--repair] [--check] [--yes]\n'; exit 0 ;;
+        *) fail "Unknown option: $argument" ;;
+    esac
+done
+load_host_installer() {
+    if [[ -f "$SCRIPT_DIR/repair.sh" ]]; then
+        source "$SCRIPT_DIR/repair.sh"
+    else
+        local repair_source
+        repair_source="$(mktemp)"
+        curl -fsSL --retry 3 "https://raw.githubusercontent.com/${INSTALLER_REPOSITORY}/main/repair.sh" -o "$repair_source"
+        source "$repair_source"
+        rm -f "$repair_source"
+    fi
+}
+if [[ "$ACTION" == repair ]]; then
+    load_host_installer
+    repair_main "${REPAIR_ARGS[@]}"
+    exit $?
+fi
+[[ ${#REPAIR_ARGS[@]} -eq 0 ]] || fail "--yes is only supported with --repair."
+
 if [[ ! -r /dev/tty ]]; then
     fail "An interactive terminal is required to install HivePanel."
 fi
@@ -282,6 +312,16 @@ handle_existing_installation() {
     fi
 
     printf '\n'
+    printf '  1) Repair existing installation (preserve data)\n'
+    printf '  2) Reinstall (permanently delete existing data)\n'
+    printf '  3) Cancel\n\n'
+    read -r -u 3 -p "Select action [1/2/3]: " answer
+    case "$answer" in
+        1) load_host_installer; repair_main; exit $? ;;
+        2) ;;
+        *) fail "Installation cancelled. Existing data was preserved." ;;
+    esac
+
     printf '\033[1;31mWARNING:\033[0m Reinstalling will permanently delete the existing HivePanel database and application data.\n'
     printf '\n'
 
@@ -442,6 +482,18 @@ printf '===================\n'
 printf '\n'
 
 install_docker
+
+if ! command -v python3 >/dev/null || ! command -v flock >/dev/null; then
+    log "Installing Python 3 and util-linux for the host updater..."
+    if command -v apt-get >/dev/null; then
+        apt-get update
+        apt-get install -y python3 util-linux
+    elif command -v dnf >/dev/null; then
+        dnf install -y python3 util-linux
+    else
+        fail "python3 and flock are required. Install them before continuing."
+    fi
+fi
 
 handle_existing_installation
 
@@ -684,31 +736,8 @@ chmod 0660 "${INSTALL_DIR}/runtime/installation.json"
 
 log "Installing the host update runner..."
 
-INSTALLER_RAW="https://raw.githubusercontent.com/${INSTALLER_REPOSITORY}/main"
-
-curl -fsSL \
-    --retry 3 \
-    "${INSTALLER_RAW}/host/hivepanel-update" \
-    -o /usr/local/sbin/hivepanel-update
-
-curl -fsSL \
-    --retry 3 \
-    "${INSTALLER_RAW}/host/hivepanel-update.service" \
-    -o /etc/systemd/system/hivepanel-update.service
-
-curl -fsSL \
-    --retry 3 \
-    "${INSTALLER_RAW}/host/hivepanel-update.path" \
-    -o /etc/systemd/system/hivepanel-update.path
-
-chmod 0755 /usr/local/sbin/hivepanel-update
-
-if command -v systemctl >/dev/null 2>&1; then
-    systemctl daemon-reload
-    systemctl enable --now hivepanel-update.path
-else
-    warn "systemd is unavailable. The HivePanel automatic update runner could not be enabled."
-fi
+load_host_installer
+install_host_tools
 
 if [[ "$REVERSE_PROXY" == false && "$ENABLE_HTTPS" =~ ^[Yy]$ ]]; then
     log "Requesting Let's Encrypt certificate..."
@@ -754,13 +783,10 @@ log "Finalising web services..."
 docker compose up -d --force-recreate nginx
 
 log "Checking HivePanel health..."
+source /usr/local/lib/hivepanel/hivepanel-common.sh
 
 for attempt in $(seq 1 60); do
-    if curl -fsS \
-        -H "Host: ${DOMAIN}" \
-        "http://127.0.0.1:${HTTP_PORT}/up" \
-        >/dev/null 2>&1
-    then
+    if health_check; then
         break
     fi
 

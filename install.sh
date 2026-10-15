@@ -386,10 +386,11 @@ configure_firewall() {
             log "Configuring firewalld..."
 
             if [[ "$REVERSE_PROXY" == true ]]; then
-                firewall-cmd \
-                    --permanent \
-                    --add-port="${HTTP_PORT}/tcp" \
-                    >/dev/null
+                if [[ -n "${REVERSE_PROXY_SOURCE_IP:-}" ]]; then
+                    firewall-cmd --permanent --add-rich-rule="rule family=ipv4 source address=${REVERSE_PROXY_SOURCE_IP}/32 port port=${HTTP_PORT} protocol=tcp accept" >/dev/null
+                else
+                    warn "No reverse proxy source IP provided; not opening port ${HTTP_PORT} in firewalld."
+                fi
             else
                 firewall-cmd \
                     --permanent \
@@ -416,7 +417,11 @@ configure_firewall() {
             log "Configuring UFW..."
 
             if [[ "$REVERSE_PROXY" == true ]]; then
-                ufw allow "${HTTP_PORT}/tcp" >/dev/null
+                if [[ -n "${REVERSE_PROXY_SOURCE_IP:-}" ]]; then
+                    ufw allow from "$REVERSE_PROXY_SOURCE_IP" to any port "$HTTP_PORT" proto tcp >/dev/null
+                else
+                    warn "No reverse proxy source IP provided; not opening port ${HTTP_PORT} in UFW."
+                fi
             else
                 ufw allow 80/tcp >/dev/null
 
@@ -432,7 +437,14 @@ configure_firewall() {
     fi
 
     if [[ "$configured" == false ]]; then
-        log "No active supported host firewall detected."
+        warn "No active supported host firewall detected. Docker-published ports can bypass host firewall rules."
+        if [[ "$REVERSE_PROXY" == true ]]; then
+            warn "Restrict TCP port ${HTTP_PORT} to the reverse proxy at your router, cloud firewall, or Docker host."
+        fi
+    fi
+    if [[ "$REVERSE_PROXY" == true ]]; then
+        warn "Check and remove any pre-existing broad allow rules for TCP ${HTTP_PORT}; a new source-specific allow rule does not override them."
+        warn "Docker port publishing may bypass UFW/firewalld. Enforce source restrictions upstream or in DOCKER-USER."
     fi
 }
 
@@ -598,6 +610,24 @@ case "$INSTALL_MODE" in
         printf 'Your reverse proxy should forward %s to HivePanel on port %s.\n' "$DOMAIN" "$HTTP_PORT"
         printf 'HTTPS should be configured on your reverse proxy, not inside HivePanel.\n'
         printf '\n'
+        printf 'For security, restrict the HivePanel HTTP port to your reverse proxy.\n'
+        read -r -u 3 -p "Reverse proxy source IPv4 address (optional): " REVERSE_PROXY_SOURCE_IP
+        REVERSE_PROXY_SOURCE_IP="${REVERSE_PROXY_SOURCE_IP:-}"
+        if [[ -n "$REVERSE_PROXY_SOURCE_IP" ]]; then
+            if ! [[ "$REVERSE_PROXY_SOURCE_IP" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+                fail "Enter a valid IPv4 address for the reverse proxy."
+            fi
+            IFS='.' read -r -a proxy_octets <<< "$REVERSE_PROXY_SOURCE_IP"
+            for octet in "${proxy_octets[@]}"; do
+                (( 10#$octet <= 255 )) || fail "Invalid reverse proxy IPv4 address."
+            done
+        else
+            warn "No proxy source IP supplied. The installer will NOT add a broad firewall allow rule."
+            warn "You must restrict port ${HTTP_PORT} to your reverse proxy outside this installer."
+            read -r -u 3 -p "Confirm the HTTP port will be protected by an external firewall [y/N]: " CONFIRM_PROXY_FIREWALL
+            [[ "$CONFIRM_PROXY_FIREWALL" =~ ^[Yy]$ ]] || fail "Installation cancelled: protect the reverse-proxy HTTP port first."
+        fi
+        printf '\n'
         ;;
     *)
         fail "Invalid installation mode. Enter 1 or 2."
@@ -657,6 +687,9 @@ DB_PASSWORD=${DB_PASSWORD}
 DB_ROOT_PASSWORD=${DB_ROOT_PASSWORD}
 SESSION_DRIVER=redis
 SESSION_LIFETIME=120
+SESSION_SECURE_COOKIE=true
+# Populated automatically from the private Docker network in reverse-proxy mode.
+TRUSTED_PROXIES=
 CACHE_STORE=redis
 QUEUE_CONNECTION=redis
 REDIS_CLIENT=phpredis
@@ -682,6 +715,22 @@ docker compose pull
 log "Starting database and Redis..."
 
 docker compose up -d mariadb redis
+
+# PHP-FPM receives requests from the Nginx container on the Docker bridge.
+# Container addresses change after recreation, so trust the dedicated Compose
+# network CIDR rather than a temporary container IP. Only attach trusted
+# HivePanel services to this network; do not share it with untrusted workloads.
+if [[ "$REVERSE_PROXY" == true ]]; then
+    REDIS_CONTAINER_ID="$(docker compose ps -q redis)"
+    [[ -n "$REDIS_CONTAINER_ID" ]] || fail "Cannot determine the Redis container ID."
+    HIVEPANEL_NETWORK_NAME="$(docker inspect --format '{{range $name, $network := .NetworkSettings.Networks}}{{$name}}{{"\n"}}{{end}}' "$REDIS_CONTAINER_ID" | head -n 1)"
+    [[ -n "$HIVEPANEL_NETWORK_NAME" ]] || fail "Cannot determine the HivePanel Docker network."
+    HIVEPANEL_NETWORK_SUBNET="$(docker network inspect --format '{{range .IPAM.Config}}{{if .Subnet}}{{.Subnet}}{{"\n"}}{{end}}{{end}}' "$HIVEPANEL_NETWORK_NAME" | head -n 1)"
+    [[ -n "$HIVEPANEL_NETWORK_SUBNET" ]] || fail "Cannot determine the HivePanel Docker network subnet."
+    sed -i "s#^TRUSTED_PROXIES=.*#TRUSTED_PROXIES=${HIVEPANEL_NETWORK_SUBNET}#" .env
+    log "Trusting forwarded headers from HivePanel Docker network ${HIVEPANEL_NETWORK_SUBNET}."
+    warn "Keep Docker network ${HIVEPANEL_NETWORK_NAME} exclusive to trusted HivePanel containers."
+fi
 
 wait_for_database
 
@@ -825,6 +874,8 @@ if [[ "$REVERSE_PROXY" == true ]]; then
     printf '  http://127.0.0.1:%s\n' "$HTTP_PORT"
     printf '\n'
     printf 'Your reverse proxy should handle the TLS/SSL certificate.\n'
+    printf 'Only your reverse proxy should be able to reach TCP %s.\n' "$HTTP_PORT"
+    printf 'Verify that no broad firewall rule exposes this port publicly.\n'
 fi
 
 printf '\n'
